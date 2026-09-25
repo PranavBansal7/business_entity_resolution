@@ -1,0 +1,18 @@
+# Core pipeline (required)
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0          # parquet caching in io_utils.py
+lightgbm>=4.5          # MIT license
+rapidfuzz>=3.9          # MIT license
+joblib>=1.3
+
+# Optional: embedding-based blocking augmentation (src/embedding_blocking.py)
+# Off by default (BlockingConfig.use_embedding_blocking=False). Needs your
+# own internet access to download model weights from huggingface.co on
+# first run — will not work in a fully offline / sandboxed environment.
+# sentence-transformers>=3.0   # Apache-2.0
+# faiss-cpu>=1.8               # MIT
+# torch>=2.2                   # BSD-3-Clause
+
+# Dev / testing
+pytest>=7.0             # tests are also directly runnable with plain `python3`, no pytest required

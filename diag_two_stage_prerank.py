@@ -1,0 +1,182 @@
+﻿"""
+diag_two_stage_prerank.py
+
+Validate the LIGHTWEIGHT pre-ranker (src/pre_ranker.py) on the aligned sample.
+Compares:
+  - BASELINE: keep top-K by n_keys -> final matcher
+  - TWO-STAGE: pre-ranker scores -> top-K -> final matcher
+
+Works on the sample in tests/real_aligned_sample_b by default.
+"""
+from pathlib import Path
+import time
+import json
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+# repo src imports
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from config import Paths, BlockingConfig, TrainConfig, COUNTRY, ENTITY_ID, GT_S1
+from io_utils import load_all_sources
+from blocking import build_normalized_frame, generate_candidates, cap_candidates
+from build_pairs import label_candidates, entity_level_split, sample_training_pairs
+from features import compute_features, FEATURE_COLUMNS
+from metric import load_gt_dict, f_beta_for_entity
+
+from pre_ranker import (
+    PRE_RANK_FEATURES,
+    compute_pre_rank_features,
+    train_pre_ranker,
+    score_pre_ranker,
+    rerank_and_cap,
+)
+
+# ---- CONFIG ----
+DATA_ROOT = Path(r"..\dataset")
+TOP_K = 150
+# ----------------
+
+THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.05), 2)
+
+
+def choose_threshold(model, val_pairs, val_gt_df, val_s1_ids, s1n, other_norm, tcfg):
+    feats = compute_features(val_pairs, s1n, other_norm)[FEATURE_COLUMNS]
+    scores = model.predict_proba(feats)[:, 1]
+    scored = val_pairs[["entity_id", "candidate_id"]].copy()
+    scored["score"] = scores
+    gt_dict = load_gt_dict(val_gt_df)
+
+    best_t = None
+    best_f = -1.0
+    for thr in THRESHOLDS:
+        total = 0.0
+        for eid in val_s1_ids:
+            true = gt_dict.get(eid, set())
+            group = scored[scored["entity_id"] == eid]
+            preds = set(group.loc[group["score"] >= thr, "candidate_id"])
+            total += f_beta_for_entity(true, preds, beta=0.5)
+        macro = total / len(val_s1_ids)
+        if macro > best_f:
+            best_f = macro
+            best_t = thr
+    return best_t, best_f
+
+
+def fit_matcher(train_pairs, s1n, other_norm, tcfg, label):
+    # train_pairs must contain 'label'
+    sampled = sample_training_pairs(train_pairs, negatives_per_positive=tcfg.negatives_per_positive,
+                                    random_seed=tcfg.random_seed)
+    feats = compute_features(sampled, s1n, other_norm)[FEATURE_COLUMNS]
+    y = sampled["label"].astype(np.uint8).to_numpy()
+    print(f"  {label}: training rows={len(feats):,}, positives={int(y.sum()):,}")
+    params = dict(tcfg.lgbm_params)
+    params["n_estimators"] = 300
+    model = lgb.LGBMClassifier(**params)
+    model.fit(feats, y)
+    return model
+
+
+def main():
+    paths = Paths(root=DATA_ROOT)
+    bcfg = BlockingConfig()
+    tcfg = TrainConfig()
+
+    s1, s2, s3, gt = load_all_sources(paths, split="train")
+
+    results = []
+
+    for country in sorted(s1[COUNTRY].unique()):
+        print("\n" + "=" * 70)
+        print(f"COUNTRY: {country}")
+        print("=" * 70)
+
+        s1_c = s1[s1[COUNTRY] == country].reset_index(drop=True)
+        s2_c = s2[s2[COUNTRY] == country]
+        s3_c = s3[s3[COUNTRY] == country]
+        gt_c = gt[gt[GT_S1].isin(s1_c[ENTITY_ID])].copy()
+
+        # split at entity level
+        train_ids, val_ids = entity_level_split(s1_c[ENTITY_ID], tcfg.val_fraction, tcfg.random_seed)
+        print(f"  S1 rows: {len(s1_c):,}  train_ids={len(train_ids):,}  val_ids={len(val_ids):,}")
+
+        # normalize S1,S2,S3
+        s1n = build_normalized_frame(s1_c, bcfg.ngram_n)
+        s2n = build_normalized_frame(s2_c, bcfg.ngram_n)
+        s3n = build_normalized_frame(s3_c, bcfg.ngram_n)
+        other_norm = pd.concat([s2n, s3n], ignore_index=True)
+
+        # generate raw candidates (full S2/S3 per country)
+        t0 = time.time()
+        cand2 = generate_candidates(s1n, s2n, bcfg)
+        cand3 = generate_candidates(s1n, s3n, bcfg)
+        raw = pd.concat([cand2, cand3], ignore_index=True)
+        print(f"  Raw candidates: {len(raw):,}  (gen {time.time()-t0:.1f}s)")
+
+        # label raw candidates against GT for training pre-ranker
+        raw_labeled = label_candidates(raw, gt_c)
+
+        # split train/val candidate pools (entity-level)
+        train_raw = raw_labeled[raw_labeled[ENTITY_ID].isin(train_ids)].reset_index(drop=True)
+        val_raw = raw_labeled[raw_labeled[ENTITY_ID].isin(val_ids)].reset_index(drop=True)
+
+        # --- Train lightweight pre-ranker on train_raw ---
+        pre_sample = sample_training_pairs(train_raw, negatives_per_positive=tcfg.negatives_per_positive,
+                                           random_seed=tcfg.random_seed)
+        print(f"  Pre-ranker training pairs: {len(pre_sample):,} | positives={int(pre_sample['label'].sum()):,}")
+
+        X_pre = compute_pre_rank_features(pre_sample, s1n, other_norm)
+        y_pre = pre_sample["label"].astype(np.uint8).to_numpy()
+
+        pre_model = train_pre_ranker(X_pre, y_pre)
+        print("  Pre-ranker trained.")
+
+        # score & rerank train/val raw pools, keep TOP_K
+        X_train_raw_pre = compute_pre_rank_features(train_raw, s1n, other_norm)
+        scores_train = score_pre_ranker(pre_model, X_train_raw_pre)
+        train_topk = rerank_and_cap(train_raw, scores_train, TOP_K)
+
+        X_val_raw_pre = compute_pre_rank_features(val_raw, s1n, other_norm)
+        scores_val = score_pre_ranker(pre_model, X_val_raw_pre)
+        val_topk = rerank_and_cap(val_raw, scores_val, TOP_K)
+
+        # --- BASELINE: top-K by n_keys (tie-breaker: keep larger n_keys) ---
+        baseline_train = (
+            train_raw.sort_values(["entity_id", "n_keys"], ascending=[True, False], kind="mergesort")
+            .groupby("entity_id", group_keys=False).head(TOP_K).reset_index(drop=True)
+        )
+        baseline_val = (
+            val_raw.sort_values(["entity_id", "n_keys"], ascending=[True, False], kind="mergesort")
+            .groupby("entity_id", group_keys=False).head(TOP_K).reset_index(drop=True)
+        )
+
+        # train final matcher for baseline
+        matcher_base = fit_matcher(baseline_train, s1n, other_norm, tcfg, "BASELINE")
+        val_gt = gt_c[gt_c[GT_S1].isin(val_ids)].copy()
+        base_t, base_f = choose_threshold(matcher_base, baseline_val, val_gt, val_ids, s1n, other_norm, tcfg)
+        print(f"  BASELINE final F0.5={base_f:.4f} threshold={base_t:.2f}")
+
+        # train final matcher for two-stage
+        matcher_two = fit_matcher(train_topk, s1n, other_norm, tcfg, "TWO-STAGE")
+        two_t, two_f = choose_threshold(matcher_two, val_topk, val_gt, val_ids, s1n, other_norm, tcfg)
+        print(f"  TWO-STAGE final F0.5={two_f:.4f} threshold={two_t:.2f}")
+
+        results.append({
+            "country": country,
+            "baseline_f05": float(base_f),
+            "baseline_threshold": float(base_t),
+            "two_stage_f05": float(two_f),
+            "two_stage_threshold": float(two_t),
+        })
+
+    df = pd.DataFrame(results)
+    print("\nFINAL SUMMARY")
+    print(df.to_string(index=False))
+    df.to_csv("two_stage_prerank_results.csv", index=False)
+
+
+if __name__ == "__main__":
+    main()
